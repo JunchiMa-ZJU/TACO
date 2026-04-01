@@ -648,8 +648,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return prefix_pad_masks, past_key_values
 
     def _expand_prefix_cache_batch(self, prefix_pad_masks, past_key_values, batch_size):
-        """Broadcast a single-observation prefix cache across a candidate batch."""
+        """Broadcast a single-observation prefix cache across a candidate batch without materializing copies."""
         if prefix_pad_masks.shape[0] == batch_size:
+            if DynamicCache is not None and not isinstance(past_key_values, DynamicCache):
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             return prefix_pad_masks, past_key_values
         if prefix_pad_masks.shape[0] != 1:
             raise ValueError(
@@ -658,19 +660,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if DynamicCache is None:
             raise ImportError("transformers.cache_utils.DynamicCache is required for prefix cache expansion.")
 
-        expanded_prefix_pad_masks = prefix_pad_masks.repeat(batch_size, 1)
+        expanded_prefix_pad_masks = prefix_pad_masks.expand(batch_size, -1)
         if not isinstance(past_key_values, DynamicCache):
             past_key_values = DynamicCache.from_legacy_cache(past_key_values)
-
-        expanded_cache = DynamicCache()
-        for layer_idx in range(len(past_key_values)):
-            key_states, value_states = past_key_values[layer_idx]
-            expanded_cache.update(
-                key_states.repeat(batch_size, 1, 1, 1),
-                value_states.repeat(batch_size, 1, 1, 1),
-                layer_idx,
-            )
-        return expanded_prefix_pad_masks, expanded_cache
+        return expanded_prefix_pad_masks, past_key_values
 
     def _build_suffix_masks(self, batch_size: int, device: torch.device, att_mask_dtype=torch.float32):
         """Create the static pad/attention masks used by suffix-only denoising."""

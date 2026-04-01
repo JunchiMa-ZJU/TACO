@@ -235,19 +235,38 @@ def eager_attention_forward(
     attention_mask: Optional[torch.Tensor],
     scaling: float,
     dropout: float = 0.0,
+    prefix_key: Optional[torch.Tensor] = None,
+    prefix_value: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    prefix_len = 0
+    prefix_value_states = None
+    if prefix_key is not None:
+        prefix_key_states = repeat_kv(prefix_key, module.num_key_value_groups)
+        prefix_value_states = repeat_kv(prefix_value, module.num_key_value_groups)
+        prefix_len = prefix_key_states.shape[-2]
+        prefix_attn_weights = torch.matmul(query, prefix_key_states.transpose(2, 3)) * scaling
+        current_attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+        attn_weights = torch.cat([prefix_attn_weights, current_attn_weights], dim=-1)
+    else:
+        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        if prefix_len:
+            causal_mask = attention_mask[:, :, :, : prefix_len + key_states.shape[-2]]
         attn_weights = attn_weights + causal_mask
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-    attn_output = torch.matmul(attn_weights, value_states)
+    if prefix_len:
+        prefix_attn_weights = attn_weights[..., :prefix_len]
+        current_attn_weights = attn_weights[..., prefix_len:]
+        attn_output = torch.matmul(prefix_attn_weights, prefix_value_states)
+        attn_output = attn_output + torch.matmul(current_attn_weights, value_states)
+    else:
+        attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     return attn_output, attn_weights
@@ -291,6 +310,8 @@ class GemmaAttention(nn.Module):
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:        
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
+        prefix_key_states = None
+        prefix_value_states = None
 
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -306,11 +327,21 @@ class GemmaAttention(nn.Module):
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                 key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             else:
-                key_states = torch.cat([past_key_value[self.layer_idx][0], key_states], dim=2)
-                value_states = torch.cat([past_key_value[self.layer_idx][1], value_states], dim=2)
+                prefix_key_states, prefix_value_states = past_key_value[self.layer_idx]
+                if prefix_key_states.shape[0] == key_states.shape[0]:
+                    key_states = torch.cat([prefix_key_states, key_states], dim=2)
+                    value_states = torch.cat([prefix_value_states, value_states], dim=2)
+                    prefix_key_states = None
+                    prefix_value_states = None
+                elif prefix_key_states.shape[0] != 1:
+                    raise ValueError(
+                        "Prefix cache batch size must either match the current batch or be broadcastable from 1."
+                    )
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
+            if prefix_key_states is not None:
+                raise ValueError("Broadcasted prefix caches currently require eager attention.")
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
@@ -321,6 +352,8 @@ class GemmaAttention(nn.Module):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
+            prefix_key=prefix_key_states,
+            prefix_value=prefix_value_states,
             **kwargs,
         )
 
