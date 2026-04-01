@@ -124,25 +124,23 @@ def rollout(
     cfn_model.eval()
 
     while not np.all(done) and step < max_steps:
-        # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
-        observation = preprocess_observation(observation)
+        need_new_chunk = len(policy._action_queue) == 0
+        processed_observation = None
+
+        if need_new_chunk or return_observations:
+            # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
+            processed_observation = preprocess_observation(observation)
         if return_observations:
-            all_observations.append(deepcopy(observation))
+            all_observations.append(deepcopy(processed_observation))
 
-        # Infer "task" from attributes of environments.
-        # TODO: works with SyncVectorEnv but not AsyncVectorEnv
-        observation = add_envs_task(env, observation)
-
-        observation['observation.state'] = observation['observation.state'].repeat(noise_num, 1)
-        observation['observation.images.image'] = observation['observation.images.image'].repeat(noise_num, 1, 1, 1)
-        observation['observation.images.image2'] = observation['observation.images.image2'].repeat(noise_num, 1, 1, 1)
-        observation['task'] = observation['task'] * noise_num
-
-        observation = preprocessor(observation)
-
-        if len(policy._action_queue) == 0:
+        if need_new_chunk:
+            # Infer "task" from attributes of environments.
+            # TODO: works with SyncVectorEnv but not AsyncVectorEnv
+            processed_observation = add_envs_task(env, processed_observation)
+            processed_observation = preprocessor(processed_observation)
             with torch.inference_mode():
-                actions, features = policy.predict_action_chunk_and_get_feature(observation, noise.clone())
+                prefix_cache = policy.build_prefix_cache_from_batch(processed_observation)
+                actions, features = policy.predict_action_chunk_and_get_feature_from_prefix_cache(prefix_cache, noise)
                 actions = actions[:, : policy.config.n_action_steps]
 
                 features = features.to(next(cfn_model.parameters()).dtype)

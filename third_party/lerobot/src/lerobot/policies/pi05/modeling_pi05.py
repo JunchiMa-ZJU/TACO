@@ -19,7 +19,7 @@ import logging
 import math
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -29,11 +29,13 @@ from lerobot.utils.import_utils import _transformers_available
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
+    from transformers.cache_utils import DynamicCache
     from transformers.models.auto import CONFIG_MAPPING
     from transformers.models.gemma import modeling_gemma
     from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
     from transformers.models.paligemma.modeling_paligemma import PaliGemmaForConditionalGeneration
 else:
+    DynamicCache = None
     CONFIG_MAPPING = None
     modeling_gemma = None
     GemmaForCausalLM = None
@@ -628,6 +630,48 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
+    def build_prefix_cache(self, images, img_masks, tokens, masks):
+        """Build reusable prefix cache for a batch of observations."""
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        return prefix_pad_masks, past_key_values
+
+    def _expand_prefix_cache_batch(self, prefix_pad_masks, past_key_values, batch_size):
+        """Broadcast a single-observation prefix cache across a candidate batch."""
+        if prefix_pad_masks.shape[0] == batch_size:
+            return prefix_pad_masks, past_key_values
+        if prefix_pad_masks.shape[0] != 1:
+            raise ValueError(
+                f"Cannot broadcast prefix batch of size {prefix_pad_masks.shape[0]} to {batch_size} candidates."
+            )
+        if DynamicCache is None:
+            raise ImportError("transformers.cache_utils.DynamicCache is required for prefix cache expansion.")
+
+        expanded_prefix_pad_masks = prefix_pad_masks.repeat(batch_size, 1)
+        if not isinstance(past_key_values, DynamicCache):
+            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+
+        expanded_cache = DynamicCache()
+        for layer_idx in range(len(past_key_values)):
+            key_states, value_states = past_key_values[layer_idx]
+            expanded_cache.update(
+                key_states.repeat(batch_size, 1, 1, 1),
+                value_states.repeat(batch_size, 1, 1, 1),
+                layer_idx,
+            )
+        return expanded_prefix_pad_masks, expanded_cache
+
     def embed_suffix(self, noisy_actions, timestep):
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
@@ -736,32 +780,28 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
-        bsize = tokens.shape[0]
-        device = tokens.device
+        prefix_pad_masks, past_key_values = self.build_prefix_cache(images, img_masks, tokens, masks)
+        return self.sample_actions_from_prefix_cache(prefix_pad_masks, past_key_values, noise=noise, num_steps=num_steps)
+
+    @torch.no_grad()
+    def sample_actions_from_prefix_cache(self, prefix_pad_masks, past_key_values, noise=None, num_steps=None) -> Tensor:
+        """Sample actions by reusing a precomputed prefix cache."""
+        if num_steps is None:
+            num_steps = self.config.num_inference_steps
+
+        prefix_batch_size = prefix_pad_masks.shape[0]
+        device = prefix_pad_masks.device
 
         if noise is None:
-            # Sample noise with padded dimension as expected by action_in_proj
             actions_shape = (
-                bsize,
+                prefix_batch_size,
                 self.config.chunk_size,
                 self.config.max_action_dim,
-            )  # Use config max_action_dim for internal processing
+            )
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        bsize = noise.shape[0]
+        prefix_pad_masks, past_key_values = self._expand_prefix_cache_batch(prefix_pad_masks, past_key_values, bsize)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -787,32 +827,32 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
-        bsize = tokens.shape[0]
-        device = tokens.device
+        prefix_pad_masks, past_key_values = self.build_prefix_cache(images, img_masks, tokens, masks)
+        return self.sample_actions_and_get_feature_from_prefix_cache(
+            prefix_pad_masks, past_key_values, noise=noise, num_steps=num_steps
+        )
+
+    @torch.no_grad()
+    def sample_actions_and_get_feature_from_prefix_cache(
+        self, prefix_pad_masks, past_key_values, noise=None, num_steps=None
+    ) -> Tensor:
+        """Sample actions and features by reusing a precomputed prefix cache."""
+        if num_steps is None:
+            num_steps = self.config.num_inference_steps
+
+        prefix_batch_size = prefix_pad_masks.shape[0]
+        device = prefix_pad_masks.device
 
         if noise is None:
-            # Sample noise with padded dimension as expected by action_in_proj
             actions_shape = (
-                bsize,
+                prefix_batch_size,
                 self.config.chunk_size,
                 self.config.max_action_dim,
-            )  # Use config max_action_dim for internal processing
+            )
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        bsize = noise.shape[0]
+        prefix_pad_masks, past_key_values = self._expand_prefix_cache_batch(prefix_pad_masks, past_key_values, bsize)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -1300,6 +1340,33 @@ class PI05Policy(PreTrainedPolicy):
         original_action_dim = self.config.output_features[ACTION].shape[0]
         actions = actions[:, :, :original_action_dim]
 
+        return actions, feature
+
+    @torch.no_grad()
+    def build_prefix_cache_from_batch(self, batch: dict[str, Tensor]) -> dict[str, Any]:
+        """Build reusable prefix cache from a single preprocessed batch."""
+        self.eval()
+        images, img_masks = self._preprocess_images(batch)
+        tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        prefix_pad_masks, past_key_values = self.model.build_prefix_cache(images, img_masks, tokens, masks)
+        return {
+            "prefix_pad_masks": prefix_pad_masks,
+            "past_key_values": past_key_values,
+        }
+
+    @torch.no_grad()
+    def predict_action_chunk_and_get_feature_from_prefix_cache(
+        self, prefix_cache: dict[str, Any], noise: Tensor = None
+    ) -> tuple[Tensor, Tensor]:
+        """Predict actions/features from a reusable prefix cache."""
+        self.eval()
+        actions, feature = self.model.sample_actions_and_get_feature_from_prefix_cache(
+            prefix_cache["prefix_pad_masks"],
+            prefix_cache["past_key_values"],
+            noise=noise,
+        )
+        original_action_dim = self.config.output_features[ACTION].shape[0]
+        actions = actions[:, :, :original_action_dim]
         return actions, feature
 
     @torch.no_grad()
