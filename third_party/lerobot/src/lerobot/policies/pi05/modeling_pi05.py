@@ -672,7 +672,40 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )
         return expanded_prefix_pad_masks, expanded_cache
 
-    def embed_suffix(self, noisy_actions, timestep):
+    def _build_suffix_masks(self, batch_size: int, device: torch.device, att_mask_dtype=torch.float32):
+        """Create the static pad/attention masks used by suffix-only denoising."""
+        suffix_pad_masks = torch.ones(batch_size, self.config.chunk_size, dtype=torch.bool, device=device)
+        suffix_att_masks = torch.zeros(batch_size, self.config.chunk_size, dtype=att_mask_dtype, device=device)
+        suffix_att_masks[:, 0] = 1
+        return suffix_pad_masks, suffix_att_masks
+
+    def _prepare_suffix_inference_runtime(
+        self, prefix_pad_masks, past_key_values, batch_size: int
+    ) -> dict[str, Any]:
+        """Prepare tensors that stay constant across all denoising steps for one candidate batch."""
+        prefix_pad_masks, past_key_values = self._expand_prefix_cache_batch(prefix_pad_masks, past_key_values, batch_size)
+
+        suffix_pad_masks, suffix_att_masks = self._build_suffix_masks(batch_size, prefix_pad_masks.device)
+        suffix_len = suffix_pad_masks.shape[1]
+        prefix_len = prefix_pad_masks.shape[1]
+
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+        prefix_offsets = prefix_pad_masks.to(dtype=torch.long).sum(dim=-1, keepdim=True)
+        suffix_positions = torch.arange(suffix_len, device=prefix_pad_masks.device, dtype=torch.long)[None, :]
+        position_ids = prefix_offsets + suffix_positions
+
+        return {
+            "past_key_values": past_key_values,
+            "suffix_pad_masks": suffix_pad_masks,
+            "suffix_att_masks": suffix_att_masks,
+            "position_ids": position_ids,
+            "full_att_2d_masks_4d": self._prepare_attention_masks_4d(full_att_2d_masks),
+        }
+
+    def embed_suffix(self, noisy_actions, timestep, suffix_pad_masks=None, suffix_att_masks=None):
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -706,16 +739,22 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         embs.append(action_time_emb)
         bsize, action_time_dim = action_time_emb.shape[:2]
-        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
-        pad_masks.append(action_time_mask)
-
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.chunk_size - 1))
+        if suffix_pad_masks is None or suffix_att_masks is None:
+            cached_pad_masks, cached_att_masks = self._build_suffix_masks(
+                bsize,
+                timestep.device,
+                att_mask_dtype=action_time_emb.dtype,
+            )
+            if suffix_pad_masks is None:
+                suffix_pad_masks = cached_pad_masks
+            if suffix_att_masks is None:
+                suffix_att_masks = cached_att_masks
+        pad_masks.append(suffix_pad_masks)
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        att_masks.append(suffix_att_masks)
+        att_masks = torch.cat(att_masks, dim=1)
 
         return embs, pad_masks, att_masks, adarms_cond
 
@@ -801,7 +840,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise = self.sample_noise(actions_shape, device)
 
         bsize = noise.shape[0]
-        prefix_pad_masks, past_key_values = self._expand_prefix_cache_batch(prefix_pad_masks, past_key_values, bsize)
+        suffix_runtime = self._prepare_suffix_inference_runtime(prefix_pad_masks, past_key_values, bsize)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -811,8 +850,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
-                prefix_pad_masks,
-                past_key_values,
+                suffix_runtime,
                 x_t,
                 expanded_time,
             )
@@ -852,25 +890,36 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             noise = self.sample_noise(actions_shape, device)
 
         bsize = noise.shape[0]
-        prefix_pad_masks, past_key_values = self._expand_prefix_cache_batch(prefix_pad_masks, past_key_values, bsize)
+        suffix_runtime = self._prepare_suffix_inference_runtime(prefix_pad_masks, past_key_values, bsize)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        feature = None
+        step_idx = 0
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
-            v_t, feaure = self.denoise_step_and_getfeature(
-                prefix_pad_masks,
-                past_key_values,
-                x_t,
-                expanded_time,
-            )
+            if step_idx == num_steps - 1:
+                v_t, feature = self.denoise_step_and_getfeature(
+                    suffix_runtime,
+                    x_t,
+                    expanded_time,
+                )
+            else:
+                v_t = self.denoise_step(
+                    suffix_runtime,
+                    x_t,
+                    expanded_time,
+                )
             x_t = x_t + dt * v_t
             time += dt
+            step_idx += 1
 
-        return x_t, feaure
+        if feature is None:
+            raise RuntimeError("Expected to collect a suffix feature on the final denoising step.")
+        return x_t, feature
 
     @torch.no_grad() 
     def add_and_denoise1step_get_feature(self, images, img_masks, tokens, masks, clean_action, noise=None, num_steps=None) -> Tensor:
@@ -904,6 +953,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+        suffix_runtime = self._prepare_suffix_inference_runtime(prefix_pad_masks, past_key_values, bsize)
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -913,8 +963,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
             v_t, feaure = self.denoise_step_and_getfeature(
-                prefix_pad_masks,
-                past_key_values,
+                suffix_runtime,
                 x_t,
                 expanded_time,
             )
@@ -926,32 +975,23 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def denoise_step(
         self,
-        prefix_pad_masks,
-        past_key_values,
+        suffix_runtime: dict[str, Any],
         x_t,
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
-
-        suffix_len = suffix_pad_masks.shape[1]
-        batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
-
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-
-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+        suffix_embs, _, _, adarms_cond = self.embed_suffix(
+            x_t,
+            timestep,
+            suffix_pad_masks=suffix_runtime["suffix_pad_masks"],
+            suffix_att_masks=suffix_runtime["suffix_att_masks"],
+        )
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
+            attention_mask=suffix_runtime["full_att_2d_masks_4d"],
+            position_ids=suffix_runtime["position_ids"],
+            past_key_values=suffix_runtime["past_key_values"],
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
@@ -964,32 +1004,23 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def denoise_step_and_getfeature(
         self,
-        prefix_pad_masks,
-        past_key_values,
+        suffix_runtime: dict[str, Any],
         x_t,
         timestep,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
-
-        suffix_len = suffix_pad_masks.shape[1]
-        batch_size = prefix_pad_masks.shape[0]
-        prefix_len = prefix_pad_masks.shape[1]
-
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-
-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+        suffix_embs, _, _, adarms_cond = self.embed_suffix(
+            x_t,
+            timestep,
+            suffix_pad_masks=suffix_runtime["suffix_pad_masks"],
+            suffix_att_masks=suffix_runtime["suffix_att_masks"],
+        )
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
+            attention_mask=suffix_runtime["full_att_2d_masks_4d"],
+            position_ids=suffix_runtime["position_ids"],
+            past_key_values=suffix_runtime["past_key_values"],
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
