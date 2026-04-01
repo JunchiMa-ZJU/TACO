@@ -41,7 +41,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
 from pprint import pformat
@@ -79,6 +79,48 @@ from lerobot.utils.utils import (
 from collections import deque
 
 from cfn.cfn_net import CFN
+
+
+@dataclass
+class TTSRuntime:
+    noise: Tensor
+    cfn_model: nn.Module
+
+
+def _build_tts_runtime(policy: PreTrainedPolicy) -> TTSRuntime:
+    """Create job-scoped TTS inference artifacts that can be reused across tasks."""
+    para = next(policy.parameters())
+    device = para.device
+    dtype = para.dtype
+    actions_shape = (
+        50,
+        policy.config.chunk_size,
+        policy.config.max_action_dim,
+    )
+    seed = 42
+    print(f"noise seed is {seed} !!!")
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    noise = torch.normal(
+        mean=0.0,
+        std=1.0,
+        size=actions_shape,
+        dtype=torch.float32,
+        generator=generator,
+    ).to(device).to(dtype)
+    print(f"noise is\n{noise}")
+
+    cfn = CFN(
+        cfn_output_dim=20,
+        cfn_hidden_dim=1536,
+    ).to(device)
+    weight_path = os.getenv("cfn_ckpt_path")
+    print(f"🔍load cfn model from: {weight_path}")
+    cfn.cfn.load_state_dict(torch.load(weight_path, map_location=device))
+    cfn_model = cfn.cfn
+    cfn_model.eval()
+
+    return TTSRuntime(noise=noise, cfn_model=cfn_model)
 
 
 
@@ -229,6 +271,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    tts_runtime: TTSRuntime | None = None,
 ) -> dict:
     """
     Args:
@@ -255,34 +298,10 @@ def eval_policy(
     start = time.time()
     policy.eval()
 
-    # get noise: 
-    para = next(policy.parameters())
-    bsize = 50
-    device = para.device
-    dtype = para.dtype
-    # actions_shape = (bsize, policy.model.config.n_action_steps, policy.model.config.max_action_dim) # this policy.model.config.n_action_steps can not match action
-    actions_shape = (bsize, 50, policy.model.config.max_action_dim)
-    seed = 42
-    torch.manual_seed(seed)
-    print(f"noise seed is {seed} !!!")
-    # noise = self.policy.model.sample_noise(actions_shape, device, dtype)
-    noise = torch.normal(
-        mean=0.0,
-        std=1.0,
-        size=actions_shape,
-        dtype=torch.float32,
-    ).to(device).to(dtype)
-    print(f"noise is\n{noise}")
-
-    cfn = CFN(
-        cfn_output_dim=20,
-        cfn_hidden_dim=1536
-    ).to(device)
-    weight_path = os.getenv("cfn_ckpt_path")
-    print(f"🔍load cfn model from: {weight_path}")
-    cfn.cfn.load_state_dict(torch.load(weight_path))
-
-    cfn_model = cfn.cfn
+    if tts_runtime is None:
+        tts_runtime = _build_tts_runtime(policy)
+    noise = tts_runtime.noise
+    cfn_model = tts_runtime.cfn_model
 
     # Determine how many batched rollouts we need to get n_episodes. Note that if n_episodes is not evenly
     # divisible by env.num_envs we end up discarding some data in the last batch.
@@ -337,7 +356,7 @@ def eval_policy(
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
             noise=noise,
-            cfn_model=cfn_model
+            cfn_model=cfn_model,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -525,16 +544,18 @@ def eval_main(cfg: EvalPipelineConfig):
         preprocessor_overrides={"device_processor": {"device": str(policy.config.device)}},
     )
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
+        tts_runtime = _build_tts_runtime(policy)
         info = eval_policy_all(
             envs=envs,
             policy=policy,
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
-            max_episodes_rendered=10,
+            max_episodes_rendered=0,
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
+            tts_runtime=tts_runtime,
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -575,6 +596,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    tts_runtime: TTSRuntime | None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -590,6 +612,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        tts_runtime=tts_runtime,
     )
 
     per_episode = task_result["per_episode"]
@@ -614,6 +637,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    tts_runtime: TTSRuntime | None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -636,6 +660,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        tts_runtime=tts_runtime,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -655,6 +680,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    tts_runtime: TTSRuntime | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -664,6 +690,8 @@ def eval_policy_all(
     plus per-task infos.
     """
     start_t = time.time()
+    if tts_runtime is None:
+        tts_runtime = _build_tts_runtime(policy)
 
     # Flatten envs into list of (task_group, task_id, env)
     tasks = [(tg, tid, vec) for tg, group in envs.items() for tid, vec in group.items()]
@@ -708,6 +736,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        tts_runtime=tts_runtime,
     )
 
     if max_parallel_tasks <= 1:
